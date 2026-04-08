@@ -1,0 +1,5 @@
+{
+  "name": "SmartReceipt OCR",
+  "description": "Extract text from payment slips and receipts based on user-defined keywords with confidence scores.",
+  "requestFramePermissions": []
+}
