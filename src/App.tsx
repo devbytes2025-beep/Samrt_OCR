@@ -1,17 +1,48 @@
-import { useState, useRef, ChangeEvent } from 'react';
-import { Upload, Image as ImageIcon, FileText, Download, Loader2, CheckCircle2, AlertCircle, X, FolderUp, FileUp, RefreshCw, FileSpreadsheet, AlertTriangle, ZoomIn, BarChart3 } from 'lucide-react';
+import { useState, useRef, ChangeEvent, useEffect, useCallback } from 'react';
+import { 
+  Upload, 
+  Image as ImageIcon, 
+  FileText, 
+  Download, 
+  Loader2, 
+  CheckCircle2, 
+  X, 
+  FolderUp, 
+  FileUp, 
+  FileSpreadsheet, 
+  AlertTriangle, 
+  Home, 
+  History as HistoryIcon, 
+  Search, 
+  Check, 
+  Clock, 
+  Zap, 
+  ShieldCheck,
+  TrendingUp,
+  ArrowRight,
+  Layers
+} from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { GoogleGenAI, Type } from '@google/genai';
 import * as XLSX from 'xlsx';
 import jsPDF from 'jspdf';
 import autoTable from 'jspdf-autotable';
+import { Toaster, toast } from 'sonner';
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+// Initialize with modern SDK pattern
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
 
 interface ExtractedData {
   keyword: string;
   value: string;
   confidence: number;
+}
+
+interface VerificationRow {
+  UTR: string;
+  Amount: string;
+  Date?: string;
+  [key: string]: any;
 }
 
 interface ProcessedFile {
@@ -21,26 +52,85 @@ interface ProcessedFile {
   status: 'idle' | 'processing' | 'success' | 'needs_review' | 'error';
   data: ExtractedData[] | null;
   errorMessage?: string;
+  processingTime?: number;
+  verificationResult?: {
+    matched: boolean;
+    matchedRow?: any;
+    percentage: number;
+    remarks: string;
+    verifiedUTR?: string;
+  };
 }
 
+type Tab = 'home' | 'standard' | 'verification' | 'history';
+
 export default function App() {
+  const [activeTab, setActiveTab] = useState<Tab>('home');
   const [files, setFiles] = useState<ProcessedFile[]>([]);
   const [keywords, setKeywords] = useState<string>('UTR, Amount, Date, Reference Number');
   const [isExtracting, setIsExtracting] = useState(false);
   const [globalError, setGlobalError] = useState<string | null>(null);
   const [progress, setProgress] = useState<number>(0);
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
+  const [excelData, setExcelData] = useState<VerificationRow[] | null>(null);
+  const [history, setHistory] = useState<any[]>([]);
+  
+  // Timer states
+  const [startTime, setStartTime] = useState<number | null>(null);
+  const [elapsedTime, setElapsedTime] = useState<number>(0);
+  const [totalEstimatedTime, setTotalEstimatedTime] = useState<number>(0);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
-  const replaceInputRef = useRef<HTMLInputElement>(null);
-  const [replaceTargetId, setReplaceTargetId] = useState<string | null>(null);
+  const excelInputRef = useRef<HTMLInputElement>(null);
+
+  // Auto-timer effect for the progress bar and ETA
+  useEffect(() => {
+    let interval: any;
+    if (isExtracting && startTime) {
+      interval = setInterval(() => {
+        setElapsedTime(Date.now() - startTime);
+      }, 100);
+    }
+    return () => clearInterval(interval);
+  }, [isExtracting, startTime]);
+
+  useEffect(() => {
+    const savedHistory = localStorage.getItem('ocr_history');
+    if (savedHistory) {
+      setHistory(JSON.parse(savedHistory).slice(0, 50));
+    }
+  }, []);
+
+  const saveToHistory = (type: string, fileCount: number, timeTaken: number) => {
+    const newEntry = {
+      id: Date.now(),
+      date: new Date().toLocaleString(),
+      type,
+      fileCount,
+      timeTaken: (timeTaken / 1000).toFixed(1) + 's'
+    };
+    const updatedHistory = [newEntry, ...history].slice(0, 50);
+    setHistory(updatedHistory);
+    localStorage.setItem('ocr_history', JSON.stringify(updatedHistory));
+  };
+
+  const clearAll = () => {
+    files.forEach(f => URL.revokeObjectURL(f.previewUrl));
+    setFiles([]);
+    setGlobalError(null);
+    setProgress(0);
+    setExcelData(null);
+    setElapsedTime(0);
+    setStartTime(null);
+    toast.info('All data cleared from session.');
+  };
 
   const handleFilesAdded = (newFiles: FileList | File[]) => {
     const validFiles = Array.from(newFiles).filter(f => f.type.startsWith('image/'));
     
     if (validFiles.length === 0) {
-      setGlobalError('No valid image files found.');
+      setGlobalError('Please upload valid receipt images (JPG, PNG).');
       return;
     }
 
@@ -54,116 +144,89 @@ export default function App() {
 
     setFiles(prev => [...prev, ...newProcessedFiles]);
     setGlobalError(null);
+    toast.success(`${validFiles.length} file(s) added successfully.`);
   };
 
-  const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files) {
-      handleFilesAdded(e.target.files);
+  const calculateFuzzyMatch = (str1: string, str2: string) => {
+    if (!str1 || !str2) return 0;
+    const s1 = String(str1).toLowerCase().replace(/[^a-z0-9]/g, '');
+    const s2 = String(str2).toLowerCase().replace(/[^a-z0-9]/g, '');
+    
+    if (s1 === s2) return 100;
+    if (s1.includes(s2) || s2.includes(s1)) return 85;
+
+    let matches = 0;
+    const minLength = Math.min(s1.length, s2.length);
+    for (let i = 0; i < minLength; i++) {
+        if (s1[i] === s2[i]) matches++;
     }
-    if (fileInputRef.current) fileInputRef.current.value = '';
+    return (matches / Math.max(s1.length, s2.length)) * 100;
   };
 
-  const handleFolderChange = (e: ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files) {
-      handleFilesAdded(e.target.files);
-    }
-    if (folderInputRef.current) folderInputRef.current.value = '';
-  };
+  const verifyDataRow = useCallback((extracted: ExtractedData[], excelRows: VerificationRow[]) => {
+    const extractedUTR = extracted.find(d => d.keyword.toLowerCase().includes('utr') || d.keyword.toLowerCase().includes('ref'))?.value || '';
+    const extractedAmount = extracted.find(d => d.keyword.toLowerCase().includes('amount'))?.value || '';
 
-  const handleReplaceFileChange = (e: ChangeEvent<HTMLInputElement>) => {
-    const selectedFile = e.target.files?.[0];
-    if (selectedFile && replaceTargetId) {
-      if (!selectedFile.type.startsWith('image/')) {
-        setGlobalError('Please upload a valid image file.');
-        return;
-      }
+    let bestMatch: any = null;
+    let highestScore = 0;
+
+    for (const row of excelRows) {
+      const excelUTRs = String(row.UTR || '').split(/[\/,]/).map(u => u.trim());
       
-      setFiles(prev => prev.map(f => {
-        if (f.id === replaceTargetId) {
-          URL.revokeObjectURL(f.previewUrl);
-          return {
-            ...f,
-            file: selectedFile,
-            previewUrl: URL.createObjectURL(selectedFile),
-            status: 'idle',
-            data: null,
-            errorMessage: undefined
-          };
+      for (const excelUTR of excelUTRs) {
+        const utrScore = calculateFuzzyMatch(extractedUTR, excelUTR);
+        const amountMatch = String(extractedAmount).replace(/[^0-9.]/g, '') === String(row.Amount).replace(/[^0-9.]/g, '');
+        
+        let score = utrScore;
+        if (amountMatch) score += 20;
+
+        if (score > highestScore) {
+          highestScore = score;
+          bestMatch = { row, excelUTR, score };
         }
-        return f;
-      }));
-    }
-    setReplaceTargetId(null);
-    if (replaceInputRef.current) replaceInputRef.current.value = '';
-  };
-
-  const triggerReplace = (id: string) => {
-    setReplaceTargetId(id);
-    if (replaceInputRef.current) {
-      replaceInputRef.current.click();
-    }
-  };
-
-  const removeFile = (id: string) => {
-    setFiles(prev => {
-      const fileToRemove = prev.find(f => f.id === id);
-      if (fileToRemove) {
-        URL.revokeObjectURL(fileToRemove.previewUrl);
       }
-      return prev.filter(f => f.id !== id);
-    });
-  };
+    }
 
-  const clearAll = () => {
-    files.forEach(f => URL.revokeObjectURL(f.previewUrl));
-    setFiles([]);
-    setGlobalError(null);
-    setProgress(0);
-  };
-
-  const fileToBase64 = (file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.readAsDataURL(file);
-      reader.onload = () => {
-        if (typeof reader.result === 'string') {
-          resolve(reader.result.split(',')[1]);
-        } else {
-          reject(new Error('Failed to convert file'));
-        }
+    if (bestMatch && bestMatch.score >= 45) {
+      const remarks = bestMatch.score >= 90 ? 'High Confidence Match' : `Possible Match (${Math.round(bestMatch.score)}%). Verify: ${bestMatch.excelUTR}`;
+      return {
+        matched: true,
+        matchedRow: bestMatch.row,
+        percentage: Math.round(bestMatch.score),
+        remarks,
+        verifiedUTR: bestMatch.excelUTR
       };
-      reader.onerror = error => reject(error);
-    });
-  };
+    }
 
-  const processFile = async (fileObj: ProcessedFile) => {
+    return {
+      matched: false,
+      percentage: Math.round(highestScore),
+      remarks: 'No alignment found. Manual verification required.'
+    };
+  }, []);
+
+  const processSingleFile = async (fileObj: ProcessedFile) => {
+    const fileStartTime = Date.now();
     setFiles(prev => prev.map(f => f.id === fileObj.id ? { ...f, status: 'processing', errorMessage: undefined } : f));
 
     try {
-      const base64Image = await fileToBase64(fileObj.file);
-      
-      const prompt = `
-        You are an expert OCR and data extraction system specialized in payment slips (like PhonePe, Paytm, Google Pay).
-        I am providing an image of a payment slip or receipt.
-        I need you to extract specific information based on the following keywords/fields: ${keywords}.
-        
-        For each keyword, find the corresponding value in the image. Be smart about synonyms (e.g., if keyword is "UTR", look for "UTR", "Ref No", "Reference Number", "Txn ID").
-        Also, provide a confidence score between 0 and 100 indicating how certain you are about the extracted value based on the image clarity and text legibility.
-        
-        If a keyword's value is not found in the image, return "Not found" for the value and 0 for confidence.
-      `;
+      const reader = new FileReader();
+      const base64Promise = new Promise<string>((resolve) => {
+        reader.onload = () => resolve((reader.result as string).split(',')[1]);
+        reader.readAsDataURL(fileObj.file);
+      });
+      const base64Image = await base64Promise;
+
+      const prompt = `Extract exactly these fields: ${keywords}. Also look for UTR/Transaction ID variations. Return JSON array: [{keyword, value, confidence}]. Confidence 0-100. If missing, value="Not found".`;
 
       const response = await ai.models.generateContent({
         model: "gemini-3-flash-preview",
-        contents: [
-          {
-            inlineData: {
-              data: base64Image,
-              mimeType: fileObj.file.type
-            }
-          },
-          prompt
-        ],
+        contents: {
+          parts: [
+            { inlineData: { data: base64Image, mimeType: fileObj.file.type } },
+            { text: prompt }
+          ]
+        },
         config: {
           responseMimeType: "application/json",
           responseSchema: {
@@ -173,7 +236,7 @@ export default function App() {
               properties: {
                 keyword: { type: Type.STRING },
                 value: { type: Type.STRING },
-                confidence: { type: Type.NUMBER, description: "Confidence score from 0 to 100" }
+                confidence: { type: Type.NUMBER }
               },
               required: ["keyword", "value", "confidence"]
             }
@@ -181,97 +244,153 @@ export default function App() {
         }
       });
 
-      const jsonText = response.text;
-      if (jsonText) {
-        const parsedData = JSON.parse(jsonText) as ExtractedData[];
-        const needsReview = parsedData.some(d => d.value === 'Not found' || d.confidence < 50);
-        
-        setFiles(prev => prev.map(f => f.id === fileObj.id ? { 
-          ...f, 
-          status: needsReview ? 'needs_review' : 'success', 
-          data: parsedData 
-        } : f));
-      } else {
-        throw new Error('No data returned from AI');
+      const parsedData = JSON.parse(response.text) as ExtractedData[];
+      let vResult = undefined;
+      
+      if (activeTab === 'verification' && excelData) {
+        vResult = verifyDataRow(parsedData, excelData);
       }
-    } catch (err) {
-      console.error(err);
+
+      const needsReview = parsedData.some(d => d.value === 'Not found' || d.confidence < 60) || 
+                          (activeTab === 'verification' && (!vResult || !vResult.matched));
+
       setFiles(prev => prev.map(f => f.id === fileObj.id ? { 
         ...f, 
-        status: 'error', 
-        errorMessage: 'Failed to extract data. Image might be unclear.' 
+        status: needsReview ? 'needs_review' : 'success', 
+        data: parsedData,
+        verificationResult: vResult,
+        processingTime: Date.now() - fileStartTime
       } : f));
+      
+      if (needsReview) {
+        toast.warning(`File ${fileObj.file.name} requires manual review.`, {
+          description: vResult?.remarks || 'Low confidence or missing fields.'
+        });
+      } else {
+        toast.success(`Processed: ${fileObj.file.name}`);
+      }
+
+      return true;
+    } catch (err) {
+      console.error(err);
+      setFiles(prev => prev.map(f => f.id === fileObj.id ? { ...f, status: 'error', errorMessage: 'Processing failed.' } : f));
+      toast.error(`Error processing ${fileObj.file.name}`);
+      return false;
     }
   };
 
-  const handleExtractAll = async () => {
-    const filesToProcess = files.filter(f => f.status === 'idle' || f.status === 'error' || f.status === 'needs_review');
-    
-    if (filesToProcess.length === 0) {
-      setGlobalError('No pending images to process.');
-      return;
-    }
-    if (!keywords.trim()) {
-      setGlobalError('Please enter at least one keyword.');
+  const handleExtractBatch = async () => {
+    const pending = files.filter(f => f.status === 'idle' || f.status === 'error' || f.status === 'needs_review');
+    if (pending.length === 0) {
+      toast.info('No pending files to process.');
       return;
     }
 
+    toast.info(`Starting batch processing for ${pending.length} file(s)...`);
     setIsExtracting(true);
-    setGlobalError(null);
+    setStartTime(Date.now());
     setProgress(0);
+    setElapsedTime(0);
+    
+    // Estimate: ~2 seconds per image in parallel mode
+    setTotalEstimatedTime(pending.length * 2000 / 2); 
 
     let completed = 0;
-    for (const fileObj of filesToProcess) {
-      await processFile(fileObj);
-      completed++;
-      setProgress(Math.round((completed / filesToProcess.length) * 100));
+    const concurrencyLimit = 2; // Process 2 at a time for speed vs stability
+    
+    for (let i = 0; i < pending.length; i += concurrencyLimit) {
+      const chunk = pending.slice(i, i + concurrencyLimit);
+      await Promise.all(chunk.map(file => processSingleFile(file)));
+      completed += chunk.length;
+      setProgress(Math.round((completed / pending.length) * 100));
     }
 
+    const totalDuration = Date.now() - (startTime || Date.now());
     setIsExtracting(false);
-    setTimeout(() => setProgress(0), 2000); // Hide progress bar after 2 seconds
+    saveToHistory(activeTab === 'standard' ? 'Batch OCR' : 'Verification', files.length, totalDuration);
+    toast.success('Batch processing complete!', {
+      description: `Processed ${files.length} files in ${(totalDuration / 1000).toFixed(1)}s`
+    });
+    setTimeout(() => setProgress(0), 1000);
+  };
+
+  const formatTime = (ms: number) => {
+    const totalSeconds = Math.floor(ms / 1000);
+    const m = Math.floor(totalSeconds / 60);
+    const s = totalSeconds % 60;
+    return `${m}:${s.toString().padStart(2, '0')}`;
   };
 
   const downloadExcel = () => {
     const rows = files.map(f => {
-      const row: any = {
-        'File Name': f.file.name,
-        'Status': f.status === 'success' ? 'Success' : f.status === 'needs_review' ? 'Needs Review' : f.status === 'error' ? 'Error' : 'Not Processed',
-      };
+      const row: any = { 'Filename': f.file.name, 'Status': f.status.toUpperCase() };
       
-      if (f.data) {
-        f.data.forEach(d => {
-          row[d.keyword] = d.value;
-          row[`${d.keyword} Confidence`] = d.confidence + '%';
-        });
+      // Add OCR extracted data
+      f.data?.forEach(d => row[d.keyword] = d.value);
+      
+      // Add Verification specific columns
+      if (f.verificationResult) {
+        row['Verified UTR'] = f.verificationResult.verifiedUTR || '—';
+        row['Accuracy %'] = f.verificationResult.percentage + '%';
+        
+        // Include reference amount and date if matched
+        if (f.verificationResult.matched && f.verificationResult.matchedRow) {
+          row['Ref Amount'] = f.verificationResult.matchedRow.Amount || '—';
+          row['Ref Date'] = f.verificationResult.matchedRow.Date || '—';
+        } else {
+          row['Ref Amount'] = '—';
+          row['Ref Date'] = '—';
+        }
+        
+        row['Audit Note'] = f.verificationResult.remarks;
       }
       return row;
     });
-
     const ws = XLSX.utils.json_to_sheet(rows);
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, ws, "Extracted Data");
-    XLSX.writeFile(wb, "extracted_receipts.xlsx");
+    XLSX.utils.book_append_sheet(wb, ws, "OCR_Audit");
+    
+    const filename = activeTab === 'verification' 
+      ? `Verification_Audit_${Date.now()}.xlsx` 
+      : `Batch_OCR_Export_${Date.now()}.xlsx`;
+      
+    XLSX.writeFile(wb, filename);
   };
 
   const downloadPDF = () => {
     const doc = new jsPDF('landscape');
-    doc.text("SmartReceipt OCR - Extracted Data", 14, 15);
+    const title = activeTab === 'verification' ? "SmartOCR Verification & Audit Report" : "SmartOCR Batch Processing Report";
+    doc.text(title, 14, 15);
     
-    // Get all unique keywords to form columns
+    // Get unique keywords across all files
     const allKeywords = new Set<string>();
     files.forEach(f => f.data?.forEach(d => allKeywords.add(d.keyword)));
     const keywordsList = Array.from(allKeywords);
     
-    const head = [['File Name', 'Status', ...keywordsList]];
+    const isVerification = activeTab === 'verification';
+    const head = [
+      ['File Name', 'Status', ...keywordsList, 
+       ...(isVerification ? ['Ref Amount', 'Ref Date'] : []),
+       'Match %', 'Notes']
+    ];
+    
     const body = files.map(f => {
       const row = [
         f.file.name, 
-        f.status === 'success' ? 'Success' : f.status === 'needs_review' ? 'Needs Review' : f.status === 'error' ? 'Error' : 'Not Processed'
+        f.status.toUpperCase(),
       ];
       keywordsList.forEach(kw => {
         const found = f.data?.find(d => d.keyword === kw);
-        row.push(found ? `${found.value} (${found.confidence}%)` : '-');
+        row.push(found ? found.value : '-');
       });
+      
+      if (isVerification) {
+        row.push(f.verificationResult?.matched ? String(f.verificationResult.matchedRow.Amount || '-') : '-');
+        row.push(f.verificationResult?.matched ? String(f.verificationResult.matchedRow.Date || '-') : '-');
+      }
+      
+      row.push(f.verificationResult ? `${f.verificationResult.percentage}%` : '-');
+      row.push(f.verificationResult ? f.verificationResult.remarks : '-');
       return row;
     });
 
@@ -279,347 +398,359 @@ export default function App() {
       head: head,
       body: body,
       startY: 20,
-      styles: { fontSize: 9, cellPadding: 3 },
-      headStyles: { fillColor: [79, 70, 229], textColor: 255, fontStyle: 'bold' },
+      styles: { fontSize: 8 },
+      headStyles: { fillColor: [79, 70, 229], textColor: 255 },
       alternateRowStyles: { fillColor: [248, 250, 252] },
-      margin: { top: 20 }
     });
     
-    doc.save("extracted_receipts.pdf");
-  };
-
-  const getConfidenceColor = (score: number) => {
-    if (score >= 90) return 'text-emerald-600 bg-emerald-50 border-emerald-200';
-    if (score >= 70) return 'text-amber-600 bg-amber-50 border-amber-200';
-    return 'text-rose-600 bg-rose-50 border-rose-200';
-  };
-
-  const getStatusBadge = (status: ProcessedFile['status']) => {
-    switch (status) {
-      case 'idle': return <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-slate-100 text-slate-700 border border-slate-200"><FileText className="w-3 h-3" /> Ready</span>;
-      case 'processing': return <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-indigo-50 text-indigo-700 border border-indigo-200"><Loader2 className="w-3 h-3 animate-spin" /> Processing</span>;
-      case 'success': return <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-50 text-emerald-700 border border-emerald-200"><CheckCircle2 className="w-3 h-3" /> Success</span>;
-      case 'needs_review': return <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-amber-50 text-amber-700 border border-amber-200"><AlertTriangle className="w-3 h-3" /> Needs Review</span>;
-      case 'error': return <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-xs font-medium bg-rose-50 text-rose-700 border border-rose-200"><AlertCircle className="w-3 h-3" /> Error</span>;
-    }
+    const filename = isVerification 
+      ? `Verification_Report_${Date.now()}.pdf` 
+      : `Batch_OCR_Report_${Date.now()}.pdf`;
+      
+    doc.save(filename);
   };
 
   const hasProcessedFiles = files.some(f => f.status === 'success' || f.status === 'needs_review');
   const stats = {
     total: files.length,
     success: files.filter(f => f.status === 'success').length,
-    needsReview: files.filter(f => f.status === 'needs_review').length,
+    review: files.filter(f => f.status === 'needs_review').length,
     error: files.filter(f => f.status === 'error').length,
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 font-sans selection:bg-indigo-100 selection:text-indigo-900 pb-20">
-      {/* Hidden Inputs */}
-      <input type="file" multiple accept="image/*" ref={fileInputRef} onChange={handleFileChange} className="hidden" />
-      <input type="file" {...{ webkitdirectory: "", directory: "" } as any} ref={folderInputRef} onChange={handleFolderChange} className="hidden" />
-      <input type="file" accept="image/*" ref={replaceInputRef} onChange={handleReplaceFileChange} className="hidden" />
+    <div className="min-h-screen bg-white text-slate-900 pb-20 selection:bg-indigo-100 flex flex-col font-sans">
+      <input type="file" multiple accept="image/*" ref={fileInputRef} onChange={(e) => e.target.files && handleFilesAdded(e.target.files)} className="hidden" />
+      <input type="file" {...{ webkitdirectory: "", directory: "" } as any} ref={folderInputRef} onChange={(e) => e.target.files && handleFilesAdded(e.target.files)} className="hidden" />
+      <input type="file" accept=".xlsx,.xls" ref={excelInputRef} onChange={(e) => {
+         const file = e.target.files?.[0];
+         if (file) {
+           const reader = new FileReader();
+           reader.onload = (evt) => {
+             const bstr = evt.target?.result;
+             const wb = XLSX.read(bstr, { type: 'binary' });
+             const ws = wb.Sheets[wb.SheetNames[0]];
+             const data = XLSX.utils.sheet_to_json(ws) as VerificationRow[];
+             setExcelData(data);
+             setGlobalError(null);
+             toast.success('Master Data Log loaded successfully!', {
+               description: `${data.length} records found for verification.`
+             });
+           };
+           reader.readAsBinaryString(file);
+         }
+      }} className="hidden" />
 
-      {/* Header */}
-      <header className="bg-white border-b border-slate-200 sticky top-0 z-20 shadow-sm">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <div className="bg-indigo-600 p-2 rounded-lg">
-              <FileSpreadsheet className="w-5 h-5 text-white" />
+      <Toaster position="top-right" expand={false} richColors closeButton />
+
+      {/* Navigation Header */}
+      <header className="sticky top-0 z-50 bg-white/80 backdrop-blur-md border-b border-slate-100 px-6 lg:px-12">
+        <div className="max-w-7xl mx-auto h-20 flex items-center justify-between">
+          <div className="flex items-center gap-12">
+            <div className="flex items-center gap-3 cursor-pointer select-none" onClick={() => { setActiveTab('home'); clearAll(); }}>
+              <div className="bg-slate-900 p-2 rounded-xl shadow-lg">
+                <Zap className="w-5 h-5 text-indigo-400" />
+              </div>
+              <div>
+                <h1 className="text-lg font-bold tracking-tight text-slate-900 leading-none">Smart<span className="text-indigo-600">OCR</span></h1>
+                <p className="text-[9px] font-black text-slate-400 tracking-[0.2em] mt-1">BATCH PROCESSOR</p>
+              </div>
             </div>
-            <h1 className="text-xl font-semibold tracking-tight text-slate-900">SmartReceipt Batch OCR</h1>
+
+            <nav className="hidden md:flex items-center gap-2">
+              {[
+                { id: 'home', label: 'Dashboard', icon: Home },
+                { id: 'standard', label: 'Extract', icon: Layers },
+                { id: 'verification', label: 'Verify', icon: ShieldCheck },
+                { id: 'history', label: 'History', icon: HistoryIcon }
+              ].map(t => (
+                <button
+                  key={t.id}
+                  onClick={() => { setActiveTab(t.id as Tab); clearAll(); }}
+                  className={`flex items-center gap-2 px-4 py-2 rounded-xl text-[13px] font-bold transition-all cursor-pointer ${activeTab === t.id ? 'bg-slate-900 text-white shadow-xl' : 'text-slate-500 hover:text-slate-900 hover:bg-slate-50'}`}
+                >
+                  <t.icon className="w-3.5 h-3.5" /> {t.label}
+                </button>
+              ))}
+            </nav>
           </div>
-          {hasProcessedFiles && (
-            <div className="flex items-center gap-3">
-              <button
-                onClick={downloadExcel}
-                className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors shadow-sm cursor-pointer"
-              >
-                <Download className="w-4 h-4" />
-                Excel
-              </button>
-              <button
-                onClick={downloadPDF}
-                className="flex items-center gap-2 bg-rose-600 hover:bg-rose-700 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors shadow-sm cursor-pointer"
-              >
-                <Download className="w-4 h-4" />
-                PDF
-              </button>
-            </div>
-          )}
+
+          <div className="flex items-center gap-3">
+            {hasProcessedFiles && (
+              <>
+                <button onClick={downloadExcel} className="bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-2.5 rounded-xl text-[11px] font-black flex items-center gap-2 transition-all shadow-lg active:scale-95 cursor-pointer">
+                  <Download className="w-4 h-4" /> EXCEL
+                </button>
+                <button onClick={downloadPDF} className="bg-rose-600 hover:bg-rose-700 text-white px-5 py-2.5 rounded-xl text-[11px] font-black flex items-center gap-2 transition-all shadow-lg active:scale-95 cursor-pointer">
+                  <Download className="w-4 h-4" /> PDF
+                </button>
+              </>
+            )}
+            <div className="w-8 h-8 rounded-full bg-slate-100 border border-slate-200 flex items-center justify-center text-[10px] font-bold text-slate-400">JD</div>
+          </div>
         </div>
       </header>
 
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
-        
-        {/* Settings & Upload Panel */}
-        <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-            
-            <div className="lg:col-span-2 space-y-4">
-              <div>
-                <label htmlFor="keywords" className="block text-sm font-medium text-slate-700 mb-1">
-                  Keywords to Extract (comma separated)
-                </label>
-                <textarea
-                  id="keywords"
-                  value={keywords}
-                  onChange={(e) => setKeywords(e.target.value)}
-                  rows={2}
-                  className="w-full rounded-xl border-slate-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500 sm:text-sm p-3 border resize-none cursor-text"
-                  placeholder="e.g., UTR, Amount, Date, Sender Name"
-                />
-                <p className="text-xs text-slate-500 mt-2">
-                  Specify the exact fields you want to extract from the payment slips.
+      <main className="flex-1 max-w-7xl mx-auto w-full px-6 lg:px-12 py-10">
+        <AnimatePresence mode="wait">
+          {activeTab === 'home' && (
+            <motion.div key="home" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} className="py-20 flex flex-col items-center text-center space-y-10">
+              <div className="space-y-6 max-w-3xl">
+                <div className="inline-flex items-center gap-2 px-4 py-1.5 bg-indigo-50 text-indigo-700 text-[10px] font-black uppercase tracking-[0.2em] rounded-full border border-indigo-100">Professional Finance Engine</div>
+                <h2 className="text-6xl font-bold tracking-tight text-slate-900 leading-[1.1]">The smartest way to <br/><span className="text-indigo-600">reconcile batch payments.</span></h2>
+                <p className="text-lg text-slate-500 font-medium leading-relaxed max-w-2xl mx-auto">
+                  Extract Transaction IDs, Amounts, and Dates from images in seconds. 
+                  Zero storage. Ultra-fast processing. Privacy first.
                 </p>
               </div>
-              
-              <AnimatePresence>
-                {globalError && (
-                  <motion.div
-                    initial={{ opacity: 0, y: -10 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    exit={{ opacity: 0, y: -10 }}
-                    className="p-3 bg-rose-50 border border-rose-200 rounded-lg flex items-start gap-2"
-                  >
-                    <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
-                    <p className="text-sm text-rose-700">{globalError}</p>
-                  </motion.div>
-                )}
-              </AnimatePresence>
-            </div>
-
-            <div className="space-y-3 flex flex-col justify-end">
-              <div className="grid grid-cols-2 gap-3">
-                <button
-                  onClick={() => fileInputRef.current?.click()}
-                  className="flex flex-col items-center justify-center gap-2 p-4 border-2 border-dashed border-slate-300 rounded-xl hover:border-indigo-400 hover:bg-indigo-50 transition-colors text-slate-600 hover:text-indigo-600 cursor-pointer"
-                >
-                  <FileUp className="w-6 h-6" />
-                  <span className="text-sm font-medium">Add Files</span>
+              <div className="flex flex-wrap justify-center gap-4">
+                <button onClick={() => setActiveTab('standard')} className="bg-slate-900 text-white px-10 py-5 rounded-2xl font-bold text-lg shadow-2xl hover:scale-105 transition-all flex items-center gap-3 active:scale-95 cursor-pointer">
+                  Launch Batch OCR <ArrowRight className="w-5 h-5" />
                 </button>
-                <button
-                  onClick={() => folderInputRef.current?.click()}
-                  className="flex flex-col items-center justify-center gap-2 p-4 border-2 border-dashed border-slate-300 rounded-xl hover:border-indigo-400 hover:bg-indigo-50 transition-colors text-slate-600 hover:text-indigo-600 cursor-pointer"
-                >
-                  <FolderUp className="w-6 h-6" />
-                  <span className="text-sm font-medium">Add Folder</span>
+                <button onClick={() => setActiveTab('verification')} className="bg-white border-2 border-slate-100 text-slate-900 px-10 py-5 rounded-2xl font-bold text-lg hover:bg-slate-50 transition-all shadow-sm active:scale-95 cursor-pointer">
+                  Verification Mode
                 </button>
               </div>
-              
-              <div className="relative">
-                <button
-                  onClick={handleExtractAll}
-                  disabled={files.length === 0 || isExtracting || !keywords.trim()}
-                  className="w-full flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 disabled:cursor-not-allowed text-white font-medium py-3 px-4 rounded-xl transition-colors shadow-sm cursor-pointer"
-                >
-                  {isExtracting ? (
-                    <>
-                      <Loader2 className="w-5 h-5 animate-spin" />
-                      Processing Batch... {progress}%
-                    </>
-                  ) : (
-                    <>
-                      <RefreshCw className="w-5 h-5" />
-                      Extract All ({files.length})
-                    </>
-                  )}
-                </button>
-                
-                {/* Progress Bar */}
-                <AnimatePresence>
-                  {progress > 0 && (
-                    <motion.div 
-                      initial={{ opacity: 0, height: 0 }}
-                      animate={{ opacity: 1, height: 4 }}
-                      exit={{ opacity: 0, height: 0 }}
-                      className="absolute -bottom-2 left-0 right-0 bg-slate-100 rounded-full overflow-hidden"
-                    >
-                      <motion.div 
-                        className="h-full bg-indigo-500"
-                        initial={{ width: 0 }}
-                        animate={{ width: `${progress}%` }}
-                        transition={{ duration: 0.3 }}
+              <div className="pt-20 grid grid-cols-2 md:grid-cols-4 gap-12 text-center opacity-50">
+                 {['Fast Execution', 'Privacy Secure', 'Multi-Asset', 'Audit Ready'].map(label => (
+                   <div key={label} className="text-[11px] font-black uppercase tracking-[0.3em]">{label}</div>
+                 ))}
+              </div>
+            </motion.div>
+          )}
+
+          {(activeTab === 'standard' || activeTab === 'verification') && (
+            <motion.div key="process" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="space-y-10">
+              {/* Main Controls Card */}
+              <div className="bg-white p-8 lg:p-12 rounded-[2.5rem] shadow-2xl shadow-slate-200/50 border border-slate-50">
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-12">
+                  <div className="lg:col-span-2 space-y-8">
+                    <div className="space-y-4">
+                      <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-1">Fields to Map</label>
+                      <textarea 
+                        value={keywords} 
+                        onChange={(e) => setKeywords(e.target.value)} 
+                        rows={2} 
+                        className="w-full rounded-2xl border-2 border-slate-50 p-6 outline-none focus:border-indigo-100 font-mono text-sm bg-slate-50/50 transition-all shadow-inner" 
+                        placeholder="UTR, Amount, Date..."
                       />
-                    </motion.div>
-                  )}
-                </AnimatePresence>
-              </div>
-            </div>
+                    </div>
 
-          </div>
-        </div>
-
-        {/* Summary Stats (Suggestion) */}
-        {files.length > 0 && (
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex items-center gap-4">
-              <div className="p-3 bg-slate-50 rounded-lg text-slate-600"><BarChart3 className="w-5 h-5" /></div>
-              <div>
-                <p className="text-sm text-slate-500 font-medium">Total Files</p>
-                <p className="text-xl font-semibold text-slate-900">{stats.total}</p>
-              </div>
-            </div>
-            <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex items-center gap-4">
-              <div className="p-3 bg-emerald-50 rounded-lg text-emerald-600"><CheckCircle2 className="w-5 h-5" /></div>
-              <div>
-                <p className="text-sm text-slate-500 font-medium">Success</p>
-                <p className="text-xl font-semibold text-emerald-700">{stats.success}</p>
-              </div>
-            </div>
-            <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex items-center gap-4">
-              <div className="p-3 bg-amber-50 rounded-lg text-amber-600"><AlertTriangle className="w-5 h-5" /></div>
-              <div>
-                <p className="text-sm text-slate-500 font-medium">Needs Review</p>
-                <p className="text-xl font-semibold text-amber-700">{stats.needsReview}</p>
-              </div>
-            </div>
-            <div className="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex items-center gap-4">
-              <div className="p-3 bg-rose-50 rounded-lg text-rose-600"><AlertCircle className="w-5 h-5" /></div>
-              <div>
-                <p className="text-sm text-slate-500 font-medium">Errors</p>
-                <p className="text-xl font-semibold text-rose-700">{stats.error}</p>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Results Grid */}
-        {files.length > 0 && (
-          <div className="space-y-4">
-            <div className="flex items-center justify-between">
-              <h2 className="text-lg font-medium text-slate-900">Uploaded Receipts</h2>
-              <button onClick={clearAll} className="text-sm text-slate-500 hover:text-rose-600 font-medium transition-colors cursor-pointer">
-                Clear All
-              </button>
-            </div>
-            
-            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
-              <AnimatePresence>
-                {files.map((fileObj) => (
-                  <motion.div
-                    key={fileObj.id}
-                    layout
-                    initial={{ opacity: 0, scale: 0.95 }}
-                    animate={{ opacity: 1, scale: 1 }}
-                    exit={{ opacity: 0, scale: 0.95 }}
-                    className={`bg-white rounded-2xl shadow-sm border overflow-hidden flex flex-col ${
-                      fileObj.status === 'needs_review' ? 'border-amber-300 ring-1 ring-amber-300' : 
-                      fileObj.status === 'error' ? 'border-rose-300 ring-1 ring-rose-300' : 'border-slate-200'
-                    }`}
-                  >
-                    {/* Card Header */}
-                    <div className="p-4 border-b border-slate-100 flex items-start justify-between gap-4 bg-slate-50/50">
-                      <div className="flex items-center gap-3 min-w-0">
-                        <div 
-                          className="w-12 h-12 rounded-lg border border-slate-200 overflow-hidden shrink-0 bg-white relative group cursor-pointer"
-                          onClick={() => setSelectedImage(fileObj.previewUrl)}
-                        >
-                          <img src={fileObj.previewUrl} alt="Preview" className="w-full h-full object-cover" />
-                          <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-                            <ZoomIn className="w-5 h-5 text-white" />
-                          </div>
+                    {activeTab === 'verification' && (
+                      <div className="flex items-center gap-8 p-6 bg-indigo-50/30 rounded-[2rem] border border-dashed border-indigo-100 relative group">
+                        <div className="bg-indigo-600 p-4 rounded-2xl text-white shadow-xl shadow-indigo-200"><FileSpreadsheet className="w-7 h-7" /></div>
+                        <div className="flex-1">
+                          <h4 className="font-bold text-indigo-900 text-lg mb-0.5">Reference Log (Excel)</h4>
+                          <p className="text-xs text-indigo-700/60 font-bold uppercase tracking-widest">Load master data to compare</p>
                         </div>
-                        <div className="min-w-0">
-                          <p className="text-sm font-medium text-slate-900 truncate" title={fileObj.file.name}>
-                            {fileObj.file.name}
-                          </p>
-                          <div className="mt-1">
-                            {getStatusBadge(fileObj.status)}
-                          </div>
-                        </div>
+                        <button onClick={() => excelInputRef.current?.click()} className={`px-8 py-3.5 rounded-xl text-[10px] font-black cursor-pointer transition-all shadow-lg active:scale-95 ${excelData ? 'bg-emerald-600 text-white' : 'bg-indigo-600 text-white'}`}>
+                          {excelData ? 'LOG LOADED' : 'UPLOAD MASTER.XLSX'}
+                        </button>
                       </div>
-                      <button
-                        onClick={() => removeFile(fileObj.id)}
-                        className="text-slate-400 hover:text-rose-500 p-1 rounded-md hover:bg-rose-50 transition-colors shrink-0 cursor-pointer"
+                    )}
+                  </div>
+
+                  <div className="flex flex-col justify-between">
+                    <div className="space-y-4">
+                      <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest px-1 text-center block">Source Images</label>
+                      <div className="grid grid-cols-2 gap-4">
+                        <button onClick={() => fileInputRef.current?.click()} className="flex flex-col items-center justify-center p-8 border-2 border-dashed border-slate-100 rounded-3xl hover:border-indigo-300 hover:bg-slate-50 cursor-pointer text-slate-400 transition-all group bg-white shadow-sm">
+                          <FileUp className="w-7 h-7 group-hover:-translate-y-1 transition-transform" />
+                          <span className="text-[9px] font-black mt-3 uppercase tracking-tighter">Choose Images</span>
+                        </button>
+                        <button onClick={() => folderInputRef.current?.click()} className="flex flex-col items-center justify-center p-8 border-2 border-dashed border-slate-100 rounded-3xl hover:border-indigo-300 hover:bg-slate-50 cursor-pointer text-slate-400 transition-all group bg-white shadow-sm">
+                          <FolderUp className="w-7 h-7 group-hover:-translate-y-1 transition-transform" />
+                          <span className="text-[9px] font-black mt-3 uppercase tracking-tighter">Bulk Folder</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="pt-8 space-y-4">
+                      {isExtracting && (
+                         <div className="flex justify-between px-1">
+                            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Engaging {progress}%</span>
+                            <span className="text-[10px] font-bold text-indigo-600 uppercase tracking-widest">ETA: {formatTime(Math.max(0, totalEstimatedTime - elapsedTime))}</span>
+                         </div>
+                      )}
+                      <button 
+                        onClick={handleExtractBatch} 
+                        disabled={files.length === 0 || isExtracting || (activeTab === 'verification' && !excelData)} 
+                        className="w-full bg-slate-900 text-white font-black py-5 rounded-[1.5rem] shadow-2xl hover:bg-indigo-600 disabled:bg-slate-100 disabled:text-slate-300 cursor-pointer transition active:scale-[0.98] relative overflow-hidden text-[13px] uppercase tracking-[0.2em]"
                       >
-                        <X className="w-4 h-4" />
+                        {isExtracting ? (
+                          <div className="flex items-center justify-center gap-3">
+                            <Loader2 className="w-5 h-5 animate-spin" />
+                            <span>Processing Batch</span>
+                          </div>
+                        ) : (
+                          <span>Analyze {files.length} Assets</span>
+                        )}
+                        <AnimatePresence>
+                          {progress > 0 && (
+                            <motion.div initial={{ width: 0 }} animate={{ width: `${progress}%` }} className="absolute bottom-0 left-0 h-1.5 bg-indigo-400" />
+                          )}
+                        </AnimatePresence>
                       </button>
                     </div>
+                  </div>
+                </div>
+              </div>
 
-                    {/* Card Body */}
-                    <div className="p-4 flex-1 flex flex-col">
-                      {fileObj.status === 'processing' ? (
-                        <div className="flex-1 flex flex-col items-center justify-center text-slate-400 py-6">
-                          <Loader2 className="w-6 h-6 animate-spin text-indigo-600 mb-2" />
-                          <p className="text-xs">Analyzing image...</p>
+              {/* Grid Result Display */}
+              {files.length > 0 && (
+                <div className="space-y-10">
+                  <header className="flex items-center justify-between px-6">
+                    <div className="flex items-center gap-10">
+                      <h3 className="text-2xl font-bold tracking-tight">Processing Buffer</h3>
+                      <div className="flex gap-4">
+                        <div className="px-4 py-2 bg-white border border-slate-100 rounded-xl shadow-sm text-[10px] font-bold text-slate-500 uppercase tracking-widest flex items-center gap-2">
+                           <div className="w-1.5 h-1.5 rounded-full bg-emerald-500" /> Verified: {stats.success}
                         </div>
-                      ) : fileObj.data ? (
-                        <div className="space-y-3 flex-1">
-                          {fileObj.data.map((item, idx) => (
-                            <div key={idx} className="flex items-center justify-between text-sm">
-                              <span className="text-slate-500 truncate pr-2" title={item.keyword}>{item.keyword}:</span>
-                              <div className="flex items-center gap-2 shrink-0">
-                                <span className={`font-mono truncate max-w-[120px] ${item.value === 'Not found' ? 'text-rose-500 italic' : 'text-slate-900'}`} title={item.value}>
-                                  {item.value}
+                        <div className="px-4 py-2 bg-white border border-slate-100 rounded-xl shadow-sm text-[10px] font-bold text-slate-500 uppercase tracking-widest flex items-center gap-2">
+                           <div className="w-1.5 h-1.5 rounded-full bg-amber-500" /> Flagged: {stats.review}
+                        </div>
+                      </div>
+                    </div>
+                    <button onClick={clearAll} className="text-[11px] font-bold text-slate-300 hover:text-rose-500 transition-all uppercase tracking-widest">Clear Queue</button>
+                  </header>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+                    {files.map(f => (
+                      <motion.div 
+                        key={f.id} 
+                        layout 
+                        initial={{ opacity: 0, scale: 0.95 }} 
+                        animate={{ opacity: 1, scale: 1 }} 
+                        className={`bg-white rounded-[2rem] border-2 shadow-xl transition-all flex flex-col group overflow-hidden ${f.verificationResult?.matched === false ? 'border-amber-100 bg-amber-50/5' : 'border-slate-50 hover:border-slate-100'}`}
+                      >
+                        <div className="p-6 border-b border-slate-50 flex items-center justify-between gap-5 bg-slate-50/10">
+                          <div className="flex items-center gap-5 min-w-0">
+                            <div 
+                              onClick={() => setSelectedImage(f.previewUrl)}
+                              className="w-12 h-12 rounded-2xl shrink-0 border border-white overflow-hidden cursor-zoom-in hover:scale-110 transition-transform shadow-lg"
+                            >
+                              <img src={f.previewUrl} className="w-full h-full object-cover" alt="receipt" />
+                            </div>
+                            <div className="min-w-0">
+                              <p className="text-[13px] font-bold truncate text-slate-900 tracking-tight">{f.file.name}</p>
+                              <div className="mt-1 flex items-center gap-2">
+                                <span className={`text-[9px] font-black px-2 py-0.5 rounded-md ${
+                                  f.status === 'success' ? 'bg-emerald-50 text-emerald-700' :
+                                  f.status === 'needs_review' ? 'bg-amber-50 text-amber-700' :
+                                  f.status === 'processing' ? 'bg-indigo-50 text-indigo-700 animate-pulse' :
+                                  f.status === 'error' ? 'bg-rose-50 text-rose-700' : 'bg-slate-100 text-slate-500'
+                                } uppercase tracking-tighter`}>
+                                  {f.status}
                                 </span>
-                                <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium border ${getConfidenceColor(item.confidence)}`}>
-                                  {item.confidence}%
-                                </span>
+                                {f.processingTime && <span className="text-[9px] font-bold text-slate-300">{(f.processingTime/1000).toFixed(1)}s</span>}
                               </div>
                             </div>
-                          ))}
-                        </div>
-                      ) : fileObj.errorMessage ? (
-                        <div className="flex-1 flex items-center justify-center text-center py-6">
-                          <p className="text-sm text-rose-600">{fileObj.errorMessage}</p>
-                        </div>
-                      ) : (
-                        <div className="flex-1 flex items-center justify-center text-center py-6">
-                          <p className="text-sm text-slate-400">Waiting to process...</p>
-                        </div>
-                      )}
-
-                      {/* Action Footer for Needs Review / Error */}
-                      {(fileObj.status === 'needs_review' || fileObj.status === 'error') && (
-                        <div className="mt-4 pt-4 border-t border-slate-100">
-                          <button
-                            onClick={() => triggerReplace(fileObj.id)}
-                            className="w-full flex items-center justify-center gap-2 text-sm font-medium text-amber-700 bg-amber-50 hover:bg-amber-100 py-2 rounded-lg transition-colors border border-amber-200 cursor-pointer"
-                          >
-                            <RefreshCw className="w-4 h-4" />
-                            Replace Image
+                          </div>
+                          <button onClick={() => setFiles(prev => prev.filter(i => i.id !== f.id))} className="p-2.5 hover:bg-rose-50 text-slate-200 hover:text-rose-500 rounded-xl transition-all">
+                            <X className="w-4 h-4" />
                           </button>
                         </div>
-                      )}
-                    </div>
-                  </motion.div>
-                ))}
-              </AnimatePresence>
-            </div>
-          </div>
-        )}
 
+                        <div className="p-8 flex-1 flex flex-col justify-between space-y-6">
+                          <div className="space-y-4">
+                            {f.data?.map((d, i) => (
+                              <div key={i} className="flex justify-between items-center text-[11px]">
+                                <span className="text-slate-400 font-bold uppercase tracking-widest">{d.keyword}</span>
+                                <span className={`font-mono px-3 py-1.5 rounded-xl border border-slate-50 ${d.value === 'Not found' ? 'text-slate-300 italic' : 'bg-slate-50 text-slate-900 font-bold shadow-sm'}`}>
+                                  {d.value}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                          
+                          {f.verificationResult && (
+                            <div className={`p-5 rounded-[1.5rem] border-2 shadow-sm transition-all ${f.verificationResult.matched ? 'bg-emerald-50/40 border-emerald-100' : 'bg-amber-50/40 border-amber-100'}`}>
+                              <div className="flex justify-between items-center mb-2.5">
+                                <span className="text-[8px] font-black uppercase tracking-[0.3em] text-slate-400">Match Accuracy</span>
+                                <span className={`text-[10px] font-black ${f.verificationResult.matched ? 'text-emerald-700' : 'text-amber-700'}`}>{f.verificationResult.percentage}% Reliable</span>
+                              </div>
+                              <p className="text-[12px] font-medium text-slate-700 leading-snug italic">"{f.verificationResult.remarks}"</p>
+                            </div>
+                          )}
+                        </div>
+                      </motion.div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </motion.div>
+          )}
+
+          {activeTab === 'history' && (
+            <motion.div key="history" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="bg-white rounded-[3rem] border border-slate-50 shadow-2xl overflow-hidden">
+              <div className="p-12 border-b border-slate-50 flex items-center justify-between bg-slate-50/10">
+                <div className="space-y-1">
+                  <h2 className="text-3xl font-bold tracking-tight">Historic Logs</h2>
+                  <p className="text-sm text-slate-400 font-bold uppercase tracking-widest opacity-60">Audit trail of past processing events.</p>
+                </div>
+                <button onClick={() => { setHistory([]); localStorage.removeItem('ocr_history'); }} className="text-[10px] font-black text-rose-500 hover:bg-rose-50 border border-rose-100 px-6 py-2.5 rounded-xl cursor-pointer uppercase transition-all">Flush Logs</button>
+              </div>
+              {history.length > 0 ? (
+                <div className="p-12">
+                  <div className="overflow-x-auto">
+                    <table className="min-w-full text-left">
+                      <thead className="text-[10px] font-black uppercase text-slate-400 tracking-widest">
+                        <tr>
+                          <th className="px-8 py-6">Timestamp</th>
+                          <th className="px-8 py-6">Category</th>
+                          <th className="px-8 py-6">Volume</th>
+                          <th className="px-8 py-6 text-right">Integrity</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-50">
+                        {history.map(h => (
+                          <tr key={h.id} className="group hover:bg-slate-50 transition-colors">
+                            <td className="px-8 py-6 text-sm font-bold text-slate-900">{h.date}</td>
+                            <td className="px-8 py-6"><span className="px-3 py-1 bg-indigo-50 text-indigo-700 text-[10px] font-black rounded-lg uppercase border border-indigo-100">{h.type}</span></td>
+                            <td className="px-8 py-6 text-sm text-slate-500 font-medium">{h.fileCount} Objects</td>
+                            <td className="px-8 py-6 text-right"><span className="inline-flex items-center gap-2 text-emerald-500 font-black text-[10px] uppercase tracking-widest"><Check className="w-4 h-4" /> Finalized</span></td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              ) : (
+                <div className="py-40 text-center space-y-8">
+                  <div className="w-24 h-24 bg-slate-50 rounded-[2rem] flex items-center justify-center mx-auto text-slate-200 border border-slate-50"><HistoryIcon className="w-10 h-10" /></div>
+                  <div className="space-y-2">
+                    <p className="text-slate-900 font-bold text-xl tracking-tight">Archive Empty</p>
+                    <p className="text-slate-400 font-bold max-w-[200px] mx-auto text-xs uppercase tracking-widest leading-relaxed">Recent batch events will be cataloged here for audit.</p>
+                  </div>
+                </div>
+              )}
+            </motion.div>
+          )}
+        </AnimatePresence>
       </main>
 
-      {/* Image Preview Modal */}
+      {/* Floating Status Bar */}
+      <footer className="fixed bottom-8 left-1/2 -translate-x-1/2 bg-slate-900/90 backdrop-blur-xl text-white px-8 py-4 rounded-full flex items-center gap-10 shadow-2xl border border-white/10 z-50">
+         <div className="flex items-center gap-3">
+            <div className="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_10px_rgba(16,185,129,0.5)]" />
+            <span className="text-[10px] font-black uppercase tracking-widest">Engine Active</span>
+         </div>
+         <div className="h-4 w-[1px] bg-white/10" />
+         <div className="flex items-center gap-3 text-white/50 text-[10px] font-black uppercase tracking-widest">
+            <ShieldCheck className="w-3 h-3" /> Zero-Storage Policy
+         </div>
+         <div className="h-4 w-[1px] bg-white/10" />
+         <p className="text-[10px] font-black uppercase tracking-widest text-indigo-400">© 2026 SmartVerify</p>
+      </footer>
+
       <AnimatePresence>
         {selectedImage && (
-          <motion.div 
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/80 backdrop-blur-sm p-4"
-            onClick={() => setSelectedImage(null)}
-          >
-            <motion.div 
-              initial={{ scale: 0.95 }}
-              animate={{ scale: 1 }}
-              exit={{ scale: 0.95 }}
-              className="relative max-w-5xl max-h-[90vh] w-full flex items-center justify-center"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <img 
-                src={selectedImage} 
-                alt="Full Preview" 
-                className="max-w-full max-h-[90vh] object-contain rounded-xl shadow-2xl"
-              />
-              <button 
-                onClick={() => setSelectedImage(null)}
-                className="absolute -top-4 -right-4 bg-white text-slate-900 p-2 rounded-full shadow-lg hover:bg-rose-50 hover:text-rose-600 transition-colors cursor-pointer"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </motion.div>
+          <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="fixed inset-0 z-[100] bg-slate-950/98 flex items-center justify-center p-12 backdrop-blur-3xl" onClick={() => setSelectedImage(null)}>
+             <div className="relative max-w-full max-h-full flex flex-col items-center">
+              <motion.img initial={{ scale: 0.98 }} animate={{ scale: 1 }} src={selectedImage} alt="expansion" className="rounded-[2.5rem] shadow-[0_0_100px_rgba(79,70,229,0.2)] max-h-[85vh] object-contain border-[10px] border-white/5" />
+              <button className="absolute -top-10 -right-10 bg-white text-slate-900 p-4 rounded-2xl cursor-pointer shadow-2xl hover:scale-110 active:scale-95 transition-all"><X className="w-7 h-7" /></button>
+              <p className="text-white/40 text-[10px] font-black uppercase tracking-[0.5em] mt-10">Esc to Close View</p>
+            </div>
           </motion.div>
         )}
       </AnimatePresence>
